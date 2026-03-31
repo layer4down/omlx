@@ -52,6 +52,21 @@ def _get_engine_pool():
     return pool
 
 
+def _resolve_model_id(model_id: str) -> str:
+    """Resolve a model alias to its actual model_id (directory name).
+
+    Uses the EnginePool's resolve_model_id method with the settings manager.
+    Returns the original model_id if no alias match is found.
+    """
+    from omlx.server import _server_state
+
+    pool = _server_state.engine_pool
+    if pool is None:
+        return model_id
+
+    return pool.resolve_model_id(model_id, _server_state.settings_manager)
+
+
 async def _read_upload(file: UploadFile) -> bytes:
     """Read an uploaded file in chunks, bailing early if it exceeds the limit."""
     chunks: list[bytes] = []
@@ -96,9 +111,12 @@ async def create_transcription(
 
     pool = _get_engine_pool()
 
+    # Resolve model alias to actual model_id
+    resolved_model = _resolve_model_id(model)
+
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(model)
+        engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
@@ -162,9 +180,12 @@ async def create_speech(request: AudioSpeechRequest):
 
     pool = _get_engine_pool()
 
+    # Resolve model alias to actual model_id
+    resolved_model = _resolve_model_id(request.model)
+
     # Load the engine via pool
     try:
-        engine = await pool.get_engine(request.model)
+        engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
@@ -211,9 +232,12 @@ async def process_audio(
 
     pool = _get_engine_pool()
 
+    # Resolve model alias to actual model_id
+    resolved_model = _resolve_model_id(model)
+
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(model)
+        engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
