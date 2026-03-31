@@ -235,9 +235,13 @@ class TestMCPClientConnect:
     async def test_connect_stdio_success(self, stdio_client: MCPClient):
         """Test successful stdio connection."""
         # Mock the internal methods instead of trying to patch imports
-        with patch.object(stdio_client, "_connect_stdio", new_callable=AsyncMock) as mock_connect, \
-             patch.object(stdio_client, "_initialize_session", new_callable=AsyncMock), \
-             patch.object(stdio_client, "_discover_tools", new_callable=AsyncMock):
+        with (
+            patch.object(
+                stdio_client, "_connect_stdio", new_callable=AsyncMock
+            ) as mock_connect,
+            patch.object(stdio_client, "_initialize_session", new_callable=AsyncMock),
+            patch.object(stdio_client, "_discover_tools", new_callable=AsyncMock),
+        ):
             mock_connect.return_value = None
             # Set up session to pass the check
             stdio_client._session = MagicMock()
@@ -251,9 +255,11 @@ class TestMCPClientConnect:
     @pytest.mark.asyncio
     async def test_connect_sse_success(self, sse_client: MCPClient):
         """Test successful SSE connection."""
-        with patch.object(sse_client, "_connect_sse", new_callable=AsyncMock), \
-             patch.object(sse_client, "_initialize_session", new_callable=AsyncMock), \
-             patch.object(sse_client, "_discover_tools", new_callable=AsyncMock):
+        with (
+            patch.object(sse_client, "_connect_sse", new_callable=AsyncMock),
+            patch.object(sse_client, "_initialize_session", new_callable=AsyncMock),
+            patch.object(sse_client, "_discover_tools", new_callable=AsyncMock),
+        ):
             sse_client._session = MagicMock()
 
             result = await sse_client.connect()
@@ -433,9 +439,14 @@ class TestMCPClientDisconnect:
         mock_stdio = AsyncMock()
 
         with (
-            patch.object(client, "_connect_stdio", new_callable=AsyncMock) as mock_connect,
-            patch.object(client, "_initialize_session", new_callable=AsyncMock) as mock_init,
+            patch.object(
+                client, "_connect_stdio", new_callable=AsyncMock
+            ) as mock_connect,
+            patch.object(
+                client, "_initialize_session", new_callable=AsyncMock
+            ) as mock_init,
         ):
+
             async def setup_partial_resources():
                 client._stdio_client = mock_stdio
                 client._session = AsyncMock()
@@ -465,8 +476,11 @@ class TestMCPClientDisconnect:
 
         with (
             patch("omlx.mcp.client.MCPClient._connect_streamable_http") as mock_connect,
-            patch.object(client, "_initialize_session", new_callable=AsyncMock) as mock_init,
+            patch.object(
+                client, "_initialize_session", new_callable=AsyncMock
+            ) as mock_init,
         ):
+
             async def setup_and_fail():
                 client._http_client = mock_http_client
                 client._streamable_http_client = mock_streamable
@@ -543,6 +557,7 @@ class TestMCPClientCallTool:
     @pytest.mark.asyncio
     async def test_call_tool_timeout(self, connected_client: MCPClient):
         """Test tool call timeout."""
+
         async def slow_call(*args, **kwargs):
             await asyncio.sleep(10)
 
@@ -591,6 +606,23 @@ class TestMCPClientCallTool:
 
         assert result.is_error is False
         assert result.content == ["Line 1", "Line 2"]
+
+    @pytest.mark.asyncio
+    async def test_call_tool_structured_content(self, connected_client: MCPClient):
+        """Test tool call with structuredContent (used by web search tools)."""
+        mock_result = MagicMock()
+        mock_result.content = []
+        mock_result.structuredContent = {"results": ["Result 1", "Result 2"]}
+        mock_result.isError = False
+        connected_client._session.call_tool.return_value = mock_result
+
+        result = await connected_client.call_tool("web_search", {"query": "test"})
+
+        assert result.is_error is False
+        assert result.content == {"results": ["Result 1", "Result 2"]}
+        connected_client._session.call_tool.assert_called_with(
+            "web_search", {"query": "test"}
+        )
 
     @pytest.mark.asyncio
     async def test_call_tool_data_content(self, connected_client: MCPClient):
