@@ -15,8 +15,8 @@ runtime = "cpython-3.11"
 requirements = [
     # Core MLX
     "mlx==0.31.1",
-    # mlx-lm from latest commit (564281f) - aligned with pyproject.toml
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+    # mlx-lm from commit dcbf6e33 - includes GenerationBatch, BatchGenerator
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7",
     # mlx-embeddings from latest commit (32981fa) - aligned with pyproject.toml
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # Server dependencies
@@ -46,8 +46,8 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (7f7a04c) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
+    # mlx-vlm from commit (23e1dff) - aligned with installed v0.3.6.patched
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@23e1dffd224488141a4f022b6d21d6a730f11507",
     "Pillow>=9.0.0",
     # Grammar-constrained decoding for structured output
     "xgrammar>=0.1.32",
