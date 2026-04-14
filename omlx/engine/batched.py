@@ -562,6 +562,8 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
                     cached_tokens=output.cached_tokens,
+                    prefill_duration_override=output.prefill_duration_override,
+                    generation_duration_override=output.generation_duration_override,
                 )
         except GeneratorExit:
             # Client disconnected
