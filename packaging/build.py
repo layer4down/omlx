@@ -440,6 +440,10 @@ def build_venvstacks():
     # so it can't go through venvstacks' uv resolver.
     _install_mlx_audio(EXPORT_DIR)
 
+    # Install dflash_mlx (DFlash speculative decoding) from previous build
+    # or local site-packages if available.
+    _install_dflash_mlx(EXPORT_DIR)
+
     # Strip large packages that are only needed for model conversion / data
     # loading, not inference. Saves ~780 MB in the app bundle.
     _strip_unused_packages(EXPORT_DIR)
@@ -486,6 +490,41 @@ def _install_mlx_audio(export_dir: Path):
 
     shutil.rmtree(audio_wheels)
     print("  ✓ mlx-audio installed")
+
+
+def _install_dflash_mlx(export_dir: Path):
+    """Install dflash_mlx into the exported framework.
+
+    dflash_mlx provides DFlash speculative decoding. It's not on PyPI, so we
+    copy it from the previous app bundle's site-packages if available, or skip.
+    """
+    fw_site = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    if not fw_site.exists():
+        return
+
+    # Already installed (e.g. from a previous build cache)?
+    if (fw_site / "dflash_mlx").exists():
+        print("  ✓ dflash_mlx already present in build")
+        return
+
+    # Try copying from the currently installed oMLX app
+    src = Path("/Applications/oMLX.app/Contents/Frameworks/framework-mlx-framework/lib/python3.11/site-packages/dflash_mlx")
+    if not src.exists():
+        # Try backup
+        src = Path("/Applications/oMLX-v0.3.6.patched.app.bak/Contents/Frameworks/framework-mlx-framework/lib/python3.11/site-packages/dflash_mlx")
+    if not src.exists():
+        print("  ⚠ dflash_mlx not found — DFlash speculative decoding will not be available")
+        return
+
+    print(f"\n  Installing dflash_mlx from {src}...")
+    shutil.copytree(src, fw_site / "dflash_mlx")
+    print("  ✓ dflash_mlx installed")
 
 
 # Packages to strip from the app bundle. These are transitive dependencies
