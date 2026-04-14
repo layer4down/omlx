@@ -93,14 +93,18 @@ class ModelSettingsRequest(BaseModel):
     index_cache_freq: Optional[int] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
-    # TurboQuant KV cache (experimental)
+    # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: Optional[bool] = None
-    turboquant_kv_bits: Optional[int] = None
+    turboquant_kv_bits: Optional[float] = None
     # SpecPrefill (experimental)
     specprefill_enabled: Optional[bool] = None
     specprefill_draft_model: Optional[str] = None
     specprefill_keep_pct: Optional[float] = None
     specprefill_threshold: Optional[int] = None
+    # Speculative Decode (DFlash)
+    specdec_enabled: Optional[bool] = None
+    specdec_draft_model: Optional[str] = None
+    specdec_block_tokens: Optional[int] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -125,8 +129,7 @@ class GlobalSettingsRequest(BaseModel):
     memory_prefill_memory_guard: Optional[bool] = None
 
     # Scheduler settings
-    max_num_seqs: Optional[int] = None
-    completion_batch_size: Optional[int] = None
+    max_concurrent_requests: Optional[int] = None
 
     # Cache settings
     cache_enabled: Optional[bool] = None
@@ -205,15 +208,9 @@ class OQStartRequest(BaseModel):
 
     model_path: str
     oq_level: float
-    enable_clip: bool = False
     group_size: int = 64
-    clip_num_samples: int = 128
-    clip_seq_length: int = 512
-    calib_dataset: str = "default"
-    clip_batch_size: int = 1024
     sensitivity_model_path: str = ""
     text_only: bool = False
-    expert_batch_size: int = 32
 
 
 class HFUploadRequest(BaseModel):
@@ -224,6 +221,7 @@ class HFUploadRequest(BaseModel):
     hf_token: str
     readme_source_path: str = ""
     auto_readme: bool = True
+    redownload_notice: bool = False
     private: bool = False
 
 
@@ -903,6 +901,15 @@ async def login_page(request: Request):
         return RedirectResponse(url="/admin/dashboard", status_code=302)
 
     global_settings = _get_global_settings()
+
+    # Skip login page when skip_api_key_verification is enabled on localhost
+    if (
+        global_settings is not None
+        and global_settings.auth.skip_api_key_verification
+        and global_settings.server.host == "127.0.0.1"
+    ):
+        return RedirectResponse(url="/admin/dashboard", status_code=302)
+
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
         request,
@@ -1525,11 +1532,11 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
-    # TurboQuant KV cache settings (temporarily disabled - ignore any values)
-    # if "turboquant_kv_enabled" in sent:
-    #     current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
-    # if "turboquant_kv_bits" in sent:
-    #     current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    # TurboQuant KV cache settings
+    if "turboquant_kv_enabled" in sent:
+        current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
+    if "turboquant_kv_bits" in sent:
+        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -1539,6 +1546,13 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    # Speculative Decode (DFlash) settings
+    if "specdec_enabled" in sent:
+        current_settings.specdec_enabled = request.specdec_enabled or False
+    if "specdec_draft_model" in sent:
+        current_settings.specdec_draft_model = request.specdec_draft_model or None
+    if "specdec_block_tokens" in sent:
+        current_settings.specdec_block_tokens = request.specdec_block_tokens or 16
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -1729,8 +1743,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
         },
         "scheduler": {
-            "max_num_seqs": global_settings.scheduler.max_num_seqs,
-            "completion_batch_size": global_settings.scheduler.completion_batch_size,
+            "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
@@ -1916,10 +1929,10 @@ async def update_global_settings(
         )
 
     # Apply scheduler settings (restart required)
-    if request.max_num_seqs is not None:
-        global_settings.scheduler.max_num_seqs = request.max_num_seqs
-    if request.completion_batch_size is not None:
-        global_settings.scheduler.completion_batch_size = request.completion_batch_size
+    if request.max_concurrent_requests is not None:
+        global_settings.scheduler.max_concurrent_requests = (
+            request.max_concurrent_requests
+        )
 
     # Apply cache settings
     cache_changed = False
@@ -3760,15 +3773,9 @@ async def start_oq_quantization(
         task = await _oq_manager.start_quantization(
             model_path=request.model_path,
             oq_level=request.oq_level,
-            enable_clip=request.enable_clip,
             group_size=request.group_size,
-            clip_num_samples=request.clip_num_samples,
-            clip_seq_length=request.clip_seq_length,
-            calib_dataset=request.calib_dataset,
-            clip_batch_size=request.clip_batch_size,
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
-            expert_batch_size=request.expert_batch_size,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
@@ -3870,6 +3877,7 @@ async def start_upload(
             token=request.hf_token,
             readme_source_path=request.readme_source_path,
             auto_readme=request.auto_readme,
+            redownload_notice=request.redownload_notice,
             private=request.private,
         )
         return {"success": True, "task": task.to_dict()}

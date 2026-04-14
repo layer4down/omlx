@@ -150,7 +150,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_multimodal_content, extract_text_content
+from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -1046,7 +1046,7 @@ def init_server(
             logger.info("Generated and saved new auth secret key")
         from .admin.auth import init_auth
 
-        init_auth(global_settings.auth.secret_key)
+        init_auth(global_settings.auth.secret_key, lambda: _server_state.global_settings)
 
     # Configure CORS middleware from settings
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
@@ -1751,6 +1751,7 @@ async def create_completion(
                 xtc_probability=xtc_probability,
                 xtc_threshold=xtc_threshold,
                 stop=request.stop,
+                seed=request.seed,
             ),
         )
         if output is None:
@@ -1769,12 +1770,15 @@ async def create_completion(
     tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
 
-    # Record metrics
+    # Record metrics (use engine-provided timing overrides when available)
+    metrics_gen_dur = getattr(output, 'generation_duration_override', None) or elapsed
+    metrics_ttft = getattr(output, 'prefill_duration_override', None) or 0.0
     get_server_metrics().record_request_complete(
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
         cached_tokens=total_cached_tokens,
-        generation_duration=elapsed,
+        prefill_duration=metrics_ttft,
+        generation_duration=metrics_gen_dur,
         model_id=request.model,
     )
 
@@ -1857,10 +1861,9 @@ async def create_chat_completion(
 
     # Extract messages - different engines need different content handling
     is_vlm = isinstance(engine, VLMBatchedEngine)
-    if engine.model_type == "gpt_oss":
-        messages = extract_harmony_messages(
-            request.messages, max_tool_result_tokens, engine.tokenizer
-        )
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
     elif is_vlm:
         # VLM: preserve image_url content parts for vision processing
         messages = extract_multimodal_content(
@@ -1942,6 +1945,10 @@ async def create_chat_completion(
         "xtc_threshold": xtc_threshold,
     }
 
+    # Add seed for reproducible generation (best-effort)
+    if request.seed is not None:
+        chat_kwargs["seed"] = request.seed
+
     # Add thinking budget if applicable
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
@@ -1981,6 +1988,36 @@ async def create_chat_completion(
     elif _server_state.settings_manager and ms.specprefill_threshold is not None:
         chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
 
+    # Speculative Decode (DFlash): resolve model settings
+    if _server_state.settings_manager and ms.specdec_enabled:
+        draft_model = ms.specdec_draft_model
+        if draft_model:
+            from .patches.dflash_specdec import is_draft_compatible
+            if not is_draft_compatible(resolved_model, draft_model):
+                logger.warning(
+                    f"DFlash draft model '{draft_model}' is not compatible with "
+                    f"target '{resolved_model}'. Skipping DFlash."
+                )
+            else:
+                chat_kwargs["specdec_enabled"] = True
+                # Configure DFlash on the engine if not already configured
+                if hasattr(engine, '_engine') and not engine._engine.is_dflash_enabled():
+                    from .patches.dflash_specdec import _ensure_dflash_available
+                    if _ensure_dflash_available():
+                        # Resolve target model to local filesystem path
+                        target_ref = resolved_model
+                        epool = get_engine_pool()
+                        if epool:
+                            entry = epool.get_entry(resolved_model)
+                            if entry and entry.model_path:
+                                target_ref = entry.model_path
+                        engine._engine.configure_dflash(
+                            enabled=True,
+                            target_ref=target_ref,
+                            draft_ref=draft_model,
+                        )
+                        logger.info(f"DFlash configured: target={target_ref}, draft={draft_model}")
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
@@ -2005,12 +2042,15 @@ async def create_chat_completion(
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
 
-    # Record metrics
+    # Record metrics (use engine-provided timing overrides when available)
+    metrics_gen_dur = output.generation_duration_override if output.generation_duration_override is not None else elapsed
+    metrics_ttft = output.prefill_duration_override if output.prefill_duration_override is not None else 0.0
     get_server_metrics().record_request_complete(
         prompt_tokens=output.prompt_tokens,
         completion_tokens=output.completion_tokens,
         cached_tokens=output.cached_tokens,
-        generation_duration=elapsed,
+        prefill_duration=metrics_ttft,
+        generation_duration=metrics_gen_dur,
         model_id=request.model,
     )
 
@@ -2268,11 +2308,26 @@ def _compile_grammar_for_request(
 
     if compiler is None:
         if structured_outputs is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="Grammar-constrained decoding requires the xgrammar package. "
-                       "Install it with: pip install 'omlx[grammar]'",
-            )
+            from omlx.utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                detail = (
+                    "Structured output is not available in the DMG version. "
+                    "xgrammar requires torch which significantly increases app size. "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                detail = (
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                detail = (
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
+            raise HTTPException(status_code=400, detail=detail)
         return None
 
     try:
@@ -2330,6 +2385,7 @@ async def stream_completion(
             xtc_probability=xtc_probability,
             xtc_threshold=xtc_threshold,
             stop=request.stop,
+            seed=request.seed,
         ):
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
@@ -2361,12 +2417,15 @@ async def stream_completion(
         end_time = time.perf_counter()
         ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
         gen_duration = end_time - (first_token_time or start_time)
+        # Use engine-provided timing overrides when available (e.g., DFlash batch generation)
+        metrics_ttft = last_output.prefill_duration_override if last_output.prefill_duration_override is not None else ttft
+        metrics_gen_dur = last_output.generation_duration_override if last_output.generation_duration_override is not None else gen_duration
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=gen_duration,
+            prefill_duration=metrics_ttft,
+            generation_duration=metrics_gen_dur,
             model_id=request.model,
         )
 
@@ -2389,10 +2448,10 @@ async def stream_completion(
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(ttft, 2),
-                    generation_duration=round(gen_duration, 2),
-                    prompt_tokens_per_second=round(pt / ttft, 2) if ttft > 0 else None,
-                    generation_tokens_per_second=round(ct / gen_duration, 2) if gen_duration > 0 else None,
+                    prompt_eval_duration=round(metrics_ttft, 2),
+                    generation_duration=round(metrics_gen_dur, 2),
+                    prompt_tokens_per_second=round(pt / metrics_ttft, 2) if metrics_ttft > 0 else None,
+                    generation_tokens_per_second=round(ct / metrics_gen_dur, 2) if metrics_gen_dur > 0 else None,
                 ).model_dump(exclude_none=True),
             }
             yield f"data: {json.dumps(usage_data)}\n\n"
@@ -2647,12 +2706,15 @@ async def stream_chat_completion(
         end_time = time.perf_counter()
         ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
         gen_duration = end_time - (first_token_time or start_time)
+        # Use engine-provided timing overrides when available (e.g., DFlash batch generation)
+        metrics_ttft = last_output.prefill_duration_override if last_output.prefill_duration_override is not None else ttft
+        metrics_gen_dur = last_output.generation_duration_override if last_output.generation_duration_override is not None else gen_duration
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=gen_duration,
+            prefill_duration=metrics_ttft,
+            generation_duration=metrics_gen_dur,
             model_id=request.model,
         )
 
@@ -2673,10 +2735,10 @@ async def stream_chat_completion(
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(ttft, 2),
-                    generation_duration=round(gen_duration, 2),
-                    prompt_tokens_per_second=round(pt / ttft, 2) if ttft > 0 else None,
-                    generation_tokens_per_second=round(ct / gen_duration, 2) if gen_duration > 0 else None,
+                    prompt_eval_duration=round(metrics_ttft, 2),
+                    generation_duration=round(metrics_gen_dur, 2),
+                    prompt_tokens_per_second=round(pt / metrics_ttft, 2) if metrics_ttft > 0 else None,
+                    generation_tokens_per_second=round(ct / metrics_gen_dur, 2) if metrics_gen_dur > 0 else None,
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
@@ -2950,12 +3012,15 @@ async def stream_anthropic_messages(
     if last_output:
         end_time = time.perf_counter()
         ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
+        gen_duration = end_time - (first_token_time or start_time)
+        metrics_ttft = last_output.prefill_duration_override if last_output.prefill_duration_override is not None else ttft
+        metrics_gen_dur = last_output.generation_duration_override if last_output.generation_duration_override is not None else gen_duration
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=end_time - (first_token_time or start_time),
+            prefill_duration=metrics_ttft,
+            generation_duration=metrics_gen_dur,
             model_id=request.model,
         )
 
@@ -3047,6 +3112,12 @@ async def create_anthropic_message(
             request, max_tool_result_tokens, engine.tokenizer,
             preserve_images=is_vlm,
         )
+
+    # Apply model-specific message extraction (e.g. Gemma 4 converts
+    # role=tool messages into tool_responses on assistant turns).
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
 
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
@@ -3146,12 +3217,15 @@ async def create_anthropic_message(
         f"({tokens_per_sec:.1f} tok/s)"
     )
 
-    # Record metrics
+    # Record metrics (use engine-provided timing overrides when available)
+    metrics_gen_dur = output.generation_duration_override if output.generation_duration_override is not None else elapsed
+    metrics_ttft = output.prefill_duration_override if output.prefill_duration_override is not None else 0.0
     get_server_metrics().record_request_complete(
         prompt_tokens=output.prompt_tokens,
         completion_tokens=output.completion_tokens,
         cached_tokens=output.cached_tokens,
-        generation_duration=elapsed,
+        prefill_duration=metrics_ttft,
+        generation_duration=metrics_gen_dur,
         model_id=request.model,
     )
 
@@ -3459,6 +3533,10 @@ async def create_response(
         "xtc_threshold": xtc_threshold,
     }
 
+    # Add seed for reproducible generation (best-effort)
+    if request.seed is not None:
+        chat_kwargs["seed"] = request.seed
+
     # Add thinking budget if applicable
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
@@ -3514,11 +3592,14 @@ async def create_response(
         f"({tokens_per_sec:.1f} tok/s)"
     )
 
+    metrics_gen_dur = output.generation_duration_override if output.generation_duration_override is not None else elapsed
+    metrics_ttft = output.prefill_duration_override if output.prefill_duration_override is not None else 0.0
     get_server_metrics().record_request_complete(
         prompt_tokens=output.prompt_tokens,
         completion_tokens=output.completion_tokens,
         cached_tokens=output.cached_tokens,
-        generation_duration=elapsed,
+        prefill_duration=metrics_ttft,
+        generation_duration=metrics_gen_dur,
         model_id=request.model,
     )
 
@@ -3909,12 +3990,15 @@ async def stream_responses_api(
         end_time = time.perf_counter()
         ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
         gen_duration = end_time - (first_token_time or start_time)
+        # Use engine-provided timing overrides when available (e.g., DFlash batch generation)
+        metrics_ttft = last_output.prefill_duration_override if last_output.prefill_duration_override is not None else ttft
+        metrics_gen_dur = last_output.generation_duration_override if last_output.generation_duration_override is not None else gen_duration
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=gen_duration,
+            prefill_duration=metrics_ttft,
+            generation_duration=metrics_gen_dur,
             model_id=request.model,
         )
         usage_data = {

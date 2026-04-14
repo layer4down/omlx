@@ -52,19 +52,15 @@ def _get_engine_pool():
     return pool
 
 
-def _resolve_model_id(model_id: str) -> str:
-    """Resolve a model alias to its actual model_id (directory name).
+def _resolve_model(model_id: str) -> str:
+    """Resolve a model alias to its real model ID.
 
-    Uses the EnginePool's resolve_model_id method with the settings manager.
-    Returns the original model_id if no alias match is found.
+    Delegates to the same resolve_model_id used by LLM/chat endpoints,
+    ensuring audio endpoints handle aliases consistently.
     """
-    from omlx.server import _server_state
+    from omlx.server import resolve_model_id
 
-    pool = _server_state.engine_pool
-    if pool is None:
-        return model_id
-
-    return pool.resolve_model_id(model_id, _server_state.settings_manager)
+    return resolve_model_id(model_id) or model_id
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -110,13 +106,11 @@ async def create_transcription(
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
-
-    # Resolve model alias to actual model_id
-    resolved_model = _resolve_model_id(model)
+    model = _resolve_model(model)
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(resolved_model)
+        engine = await pool.get_engine(model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
@@ -179,9 +173,7 @@ async def create_speech(request: AudioSpeechRequest):
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
 
     pool = _get_engine_pool()
-
-    # Resolve model alias to actual model_id
-    resolved_model = _resolve_model_id(request.model)
+    resolved_model = _resolve_model(request.model)
 
     # Load the engine via pool
     try:
@@ -190,7 +182,7 @@ async def create_speech(request: AudioSpeechRequest):
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{request.model}' not found. Available: {avail}",
+            detail=f"Model '{resolved_model}' not found. Available: {avail}",
         ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -198,7 +190,7 @@ async def create_speech(request: AudioSpeechRequest):
     if not isinstance(engine, TTSEngine):
         raise HTTPException(
             status_code=400,
-            detail=f"Model '{request.model}' is not a text-to-speech model",
+            detail=f"Model '{resolved_model}' is not a text-to-speech model",
         )
 
     try:
@@ -231,13 +223,11 @@ async def process_audio(
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
-
-    # Resolve model alias to actual model_id
-    resolved_model = _resolve_model_id(model)
+    model = _resolve_model(model)
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(resolved_model)
+        engine = await pool.get_engine(model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(

@@ -3,6 +3,7 @@
 Base engine interface for oMLX inference.
 """
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -27,6 +28,9 @@ class GenerationOutput:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     # Prefix cache stats
     cached_tokens: int = 0
+    # Timing overrides (set by DFlash and other batch-generation paths)
+    prefill_duration_override: Optional[float] = None
+    generation_duration_override: Optional[float] = None
 
 
 class BaseEngine(ABC):
@@ -208,6 +212,17 @@ class BaseEngine(ABC):
         """
         return None
 
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests.
+
+        Used by EnginePool.check_ttl_expirations() to prevent unloading
+        a model while requests are still being processed.
+
+        Returns:
+            True if there are active requests, False otherwise.
+        """
+        return False
+
     @abstractmethod
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics.
@@ -233,6 +248,14 @@ class BaseNonStreamingEngine(ABC):
     These engines compute outputs in a single forward pass and don't
     support streaming or chat completion interfaces.
     """
+
+    def __init__(self):
+        self._active_count = 0
+        self._active_lock = threading.Lock()
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        return self._active_count > 0
 
     @property
     @abstractmethod

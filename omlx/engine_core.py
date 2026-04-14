@@ -122,6 +122,12 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
+        # DFlash speculative decode state
+        self._dflash_target_ref: Optional[str] = None
+        self._dflash_draft_ref: Optional[str] = None
+        self._dflash_enabled: bool = False
+        self._dflash_model = None  # Already-loaded model (reused, no dup memory)
+
         # Global single-thread executor shared across ALL engines.
         # mlx-lm uses a module-level Metal stream, so concurrent MLX calls
         # from different engine threads cause segfaults. See issue #85.
@@ -593,6 +599,187 @@ class EngineCore:
         # Return in original order
         return [results[rid] for rid in request_ids]
 
+    # ── DFlash Speculative Decode ──────────────────────────────────────────
+
+    def configure_dflash(
+        self,
+        enabled: bool,
+        target_ref: Optional[str] = None,
+        draft_ref: Optional[str] = None,
+    ) -> None:
+        """Configure DFlash speculative decoding for this engine.
+
+        Args:
+            enabled: Whether to enable DFlash.
+            target_ref: Target model reference (HF ID or local path).
+            draft_ref: DFlash draft model reference (HF ID or local path).
+        """
+        self._dflash_enabled = enabled
+        self._dflash_target_ref = target_ref
+        self._dflash_draft_ref = draft_ref
+        if enabled:
+            logger.info(
+                f"DFlash speculative decode enabled: "
+                f"target={target_ref}, draft={draft_ref}"
+            )
+        else:
+            logger.info("DFlash speculative decode disabled")
+
+    def is_dflash_enabled(self) -> bool:
+        """Check if DFlash speculative decode is active."""
+        return self._dflash_enabled
+
+    async def add_dflash_request(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: Optional[SamplingParams] = None,
+        request_id: Optional[str] = None,
+        use_chat_template: bool = True,
+    ) -> str:
+        """Add a request using DFlash speculative decoding.
+
+        This bypasses the normal scheduler/BatchGenerator path and runs
+        DFlash generation directly on the MLX executor. Tokens are emitted
+        through the same RequestOutputCollector mechanism for SSE streaming.
+
+        Args:
+            prompt: Input prompt (string or token IDs).
+            sampling_params: Generation parameters (max_tokens used).
+            request_id: Optional custom request ID.
+            use_chat_template: Whether to apply chat template.
+
+        Returns:
+            The request ID.
+        """
+        if request_id is None:
+            request_id = str(uuid.uuid4())
+
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
+        # Setup output collector
+        self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)
+        self._stream_states[request_id] = RequestStreamState(
+            stream_interval=self.config.stream_interval
+        )
+        self._finished_events[request_id] = asyncio.Event()
+
+        max_tokens = sampling_params.max_tokens or 4096
+        prompt_str = prompt if isinstance(prompt, str) else self.tokenizer.decode(prompt)
+
+        # Run DFlash generation in background
+        asyncio.create_task(
+            self._run_dflash_generation(
+                request_id=request_id,
+                prompt=prompt_str,
+                max_tokens=max_tokens,
+                use_chat_template=use_chat_template,
+            )
+        )
+
+        return request_id
+
+    async def _run_dflash_generation(
+        self,
+        request_id: str,
+        prompt: str,
+        max_tokens: int,
+        use_chat_template: bool = True,
+    ) -> None:
+        """Run DFlash generation and emit tokens through the collector.
+
+        Runs on the MLX executor thread for GPU serialization.
+        """
+        loop = asyncio.get_running_loop()
+        collector = self._output_collectors.get(request_id)
+        if collector is None:
+            return
+
+        def _generate():
+            from .patches.dflash_specdec import run_dflash_generation
+
+            try:
+                gen_start = time.perf_counter()
+                completion_tokens = 0
+                prompt_token_count = 0
+                prefill_duration = 0.0
+                acceptance = 0.0
+                tokenizer = None
+
+                # run_dflash_generation is now a generator — yields events as they arrive
+                # so tokens stream to the collector in real-time instead of batching
+                for event in run_dflash_generation(
+                    target_ref=self._dflash_target_ref,
+                    draft_ref=self._dflash_draft_ref,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    use_chat_template=use_chat_template,
+                ):
+                    if event.get("event") == "token":
+                        # Lazily resolve tokenizer on first token
+                        if tokenizer is None:
+                            from .patches.dflash_specdec import _cached_drafts, _cache_lock
+                            cache_key = f"{self._dflash_target_ref}::{self._dflash_draft_ref}"
+                            with _cache_lock:
+                                tokenizer = _cached_drafts.get(cache_key, {}).get("tokenizer")
+                            if tokenizer is None:
+                                # Fallback: use engine's own tokenizer
+                                tokenizer = self.tokenizer
+                        token_id = int(event["token_id"])
+                        text = tokenizer.decode([token_id])
+                        completion_tokens += 1
+                        collector.put(RequestOutput(
+                            request_id=request_id,
+                            new_text=text,
+                            finished=False,
+                            completion_tokens=completion_tokens,
+                        ))
+                    elif event.get("event") == "summary":
+                        prompt_token_count = event.get("prompt_token_count", 0)
+                        acceptance = event.get("acceptance_ratio", 0.0)
+                        phase_timings = event.get("phase_timings_us", {})
+                        prefill_duration = phase_timings.get("prefill", 0.0) / 1_000_000.0
+                    elif event.get("event") == "error":
+                        logger.error(f"DFlash event error: {event.get('error', 'unknown')}")
+
+                gen_elapsed = time.perf_counter() - gen_start
+                logger.info(
+                    f"DFlash request {request_id} completed: "
+                    f"{completion_tokens} tokens in {gen_elapsed:.2f}s "
+                    f"({completion_tokens / gen_elapsed:.1f} tok/s), "
+                    f"prompt={prompt_token_count}, "
+                    f"acceptance={acceptance:.1%}"
+                )
+
+                # Signal completion with accurate metrics
+                collector.put(RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="stop" if completion_tokens > 0 else "length",
+                    prompt_tokens=prompt_token_count,
+                    completion_tokens=completion_tokens,
+                    prefill_duration_override=prefill_duration if prefill_duration > 0 else None,
+                    generation_duration_override=gen_elapsed if gen_elapsed > 0 else None,
+                ))
+
+            except Exception as e:
+                import traceback
+                logger.error(f"DFlash generation failed: {e}\n{traceback.format_exc()}")
+                collector.put(RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="error",
+                    error=str(e),
+                    new_text=f"\n\n[DFlash error: {e}]",
+                ))
+
+        try:
+            await loop.run_in_executor(self._mlx_executor, _generate)
+        finally:
+            event = self._finished_events.get(request_id)
+            if event:
+                event.set()
+
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
         scheduler_stats = self.scheduler.get_stats()
@@ -764,3 +951,21 @@ class AsyncEngineCore:
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get prefix cache statistics."""
         return self.engine.get_cache_stats()
+
+    # DFlash speculative decode proxies
+    def configure_dflash(self, enabled: bool, target_ref=None, draft_ref=None):
+        """Configure DFlash speculative decoding."""
+        self.engine.configure_dflash(enabled=enabled, target_ref=target_ref, draft_ref=draft_ref)
+
+    def is_dflash_enabled(self) -> bool:
+        """Check if DFlash speculative decoding is enabled."""
+        return self.engine.is_dflash_enabled()
+
+    async def add_dflash_request(self, prompt, sampling_params=None, request_id=None, use_chat_template=True) -> str:
+        """Add a DFlash speculative decode request."""
+        return await self.engine.add_dflash_request(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            use_chat_template=use_chat_template,
+        )

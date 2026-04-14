@@ -158,7 +158,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     max_tokens: Optional[int] = None
-    stream: bool = False
+    stream: bool = True
     stream_options: Optional[StreamOptions] = None
     stop: Optional[List[str]] = None
     min_p: float | None = None
@@ -183,6 +183,10 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: Optional[float] = None
     # SpecPrefill: per-request threshold override (min tokens to trigger, None = use model setting)
     specprefill_threshold: Optional[int] = None
+    # Speculative Decode (DFlash): per-request enable/disable (None = use model setting)
+    specdec: Optional[bool] = None
+    # Seed for reproducible generation (best-effort)
+    seed: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -248,7 +252,7 @@ class CompletionRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     max_tokens: Optional[int] = None
-    stream: bool = False
+    stream: bool = True
     stream_options: Optional[StreamOptions] = None
     stop: Optional[List[str]] = None
     min_p: float | None = None
@@ -256,6 +260,8 @@ class CompletionRequest(BaseModel):
     xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # Seed for reproducible generation (best-effort)
+    seed: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod

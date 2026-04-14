@@ -13,7 +13,9 @@
     function dashboard() {
         return {
             // Theme
-            theme: localStorage.getItem('omlx-chat-theme') || 'light',
+            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            activeTheme: 'light', // Will be updated by applyTheme
+            systemThemeListener: null,
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -30,7 +32,7 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
-                scheduler: { max_num_seqs: 8, completion_batch_size: 8 },
+                scheduler: { max_concurrent_requests: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
@@ -266,14 +268,8 @@
             _oqRefreshTimer: null,
             // oQ Advanced Settings
             oqAdvancedOpen: false,
-            oqEnableClip: false,
             oqTextOnly: false,
-            oqClipSamples: 128,
-            oqClipSeqLen: 512,
-            oqCalibDataset: 'code_multilingual',
-            oqClipBatchSize: 1024,
             oqSensitivityModelPath: '',
-            oqExpertBatchSize: 32,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -632,8 +628,7 @@
                 if (!s.server.host) errors.push('Host');
                 if (!s.server.port) errors.push('Port');
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_num_seqs) errors.push('Max Sequences');
-                if (!s.scheduler.completion_batch_size) errors.push('Completion Batch Size');
+                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
                 if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
                 if (!s.sampling.max_context_window) errors.push('Max Context Window');
                 if (!s.sampling.max_tokens) errors.push('Max Tokens');
@@ -671,8 +666,7 @@
                             model_fallback: this.globalSettings.model.model_fallback,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
-                            max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
-                            completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
+                            max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -932,6 +926,9 @@
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
                     specprefill_threshold: settings.specprefill_threshold || null,
+                    specdec_enabled: settings.specdec_enabled || false,
+                    specdec_draft_model: settings.specdec_draft_model || '',
+                    specdec_block_tokens: settings.specdec_block_tokens || 16,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -996,7 +993,7 @@
                                     ? forcedCtKwargs : null,
                                 turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
-                                    ? (this.modelSettings.turboquant_kv_bits || 4)
+                                    ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
@@ -1006,6 +1003,9 @@
                                 specprefill_threshold: this.modelSettings.specprefill_enabled
                                     ? (this.modelSettings.specprefill_threshold || null)
                                     : null,
+                                specdec_enabled: this.modelSettings.specdec_enabled,
+                                specdec_draft_model: this.modelSettings.specdec_draft_model || null,
+                                specdec_block_tokens: this.modelSettings.specdec_block_tokens || 16,
                             };
                         })()),
                     });
@@ -2439,15 +2439,37 @@
                 }
             },
 
-            // Theme toggle
-            toggleTheme() {
-                this.theme = this.theme === 'light' ? 'dark' : 'light';
+            // Theme select
+            setTheme(theme) {
+                this.theme = theme;
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
             },
 
             applyTheme() {
-                document.documentElement.setAttribute('data-theme', this.theme);
+                // Clean up existing listener
+                if (this.systemThemeListener) {
+                    window.matchMedia('(prefers-color-scheme: dark)').removeEventListener('change', this.systemThemeListener);
+                    this.systemThemeListener = null;
+                }
+
+                if (this.theme === 'auto') {
+                    // Detect system theme
+                    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                    this.activeTheme = prefersDark ? 'dark' : 'light';
+                    document.documentElement.setAttribute('data-theme', this.activeTheme);
+
+                    // Add listener for system theme changes
+                    this.systemThemeListener = (e) => {
+                        this.activeTheme = e.matches ? 'dark' : 'light';
+                        document.documentElement.setAttribute('data-theme', this.activeTheme);
+                    };
+                    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', this.systemThemeListener);
+                } else {
+                    // Use explicit theme
+                    this.activeTheme = this.theme;
+                    document.documentElement.setAttribute('data-theme', this.activeTheme);
+                }
             },
 
             // =================================================================
@@ -2693,15 +2715,9 @@
                         body: JSON.stringify({
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
-                            enable_clip: this.oqEnableClip,
                             group_size: 64,
-                            clip_num_samples: this.oqClipSamples,
-                            clip_seq_length: this.oqClipSeqLen,
-                            calib_dataset: this.oqCalibDataset,
-                            clip_batch_size: this.oqClipBatchSize,
                             sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
-                            expert_batch_size: this.oqExpertBatchSize,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -2801,11 +2817,6 @@
                 );
             },
 
-            oqSelectedModelSupportsClip() {
-                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
-                return model?.supports_clip || false;
-            },
-
             oqSelectedModelIsVLM() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.is_vlm || false;
@@ -2814,9 +2825,6 @@
             oqEstimatedMemory() {
                 // Use precise estimate from API if available
                 if (this.oqEstimate) {
-                    if (this.oqEnableClip) {
-                        return this.oqEstimate.memory_clip_formatted || '';
-                    }
                     // If sensitivity model selected, memory ≈ sensitivity model size × 1.5
                     if (this.oqSensitivityModelPath) {
                         const sensModel = this.oqAllModels.find(m => m.path === this.oqSensitivityModelPath);
@@ -2831,9 +2839,6 @@
                 // Fallback to rough model-level estimate
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 if (!model) return '';
-                if (this.oqEnableClip) {
-                    return model.memory_clip?.peak_formatted || '';
-                }
                 return model.memory_streaming?.peak_formatted || '';
             },
 
@@ -2924,6 +2929,7 @@
                 this.uploadModalRepoId = (this.uploadHfNamespace || this.uploadHfUsername) + '/' + model.name;
                 this.uploadReadmeSource = '';
                 this.uploadAutoReadme = true;
+                this.uploadRedownloadNotice = false;
                 this.uploadPrivate = false;
                 this.uploadStarting = false;
                 this.uploadModalOpen = true;
@@ -2943,6 +2949,7 @@
                             hf_token: this.uploadHfToken,
                             readme_source_path: this.uploadReadmeSource,
                             auto_readme: this.uploadAutoReadme,
+                            redownload_notice: this.uploadRedownloadNotice && this.uploadReadmeSource === '',
                             private: this.uploadPrivate,
                         }),
                     });

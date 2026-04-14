@@ -77,6 +77,9 @@ class SamplingParams:
     # Typed as Any to avoid a hard dependency on xgrammar at import time.
     compiled_grammar: Any = None
 
+    # Seed for reproducible generation (best-effort, per OpenAI spec)
+    seed: Optional[int] = None
+
     def __post_init__(self):
         if self.stop is None:
             self.stop = []
@@ -236,6 +239,9 @@ class RequestOutput:
     tool_calls: Optional[List[Dict[str, str]]] = None
     # Prefix cache stats
     cached_tokens: int = 0
+    # Timing overrides (set by DFlash and other batch-generation paths)
+    prefill_duration_override: Optional[float] = None
+    generation_duration_override: Optional[float] = None
     # Error message (set when engine encounters an unrecoverable error)
     error: Optional[str] = None
 
