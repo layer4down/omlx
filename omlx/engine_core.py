@@ -15,6 +15,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 import asyncio
 import concurrent.futures
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -618,9 +619,15 @@ class EngineCore:
         self._dflash_target_ref = target_ref
         self._dflash_draft_ref = draft_ref
         if enabled:
+            # Set DFLASH_MAX_CTX so dflash_mlx doesn't silently fall back to
+            # slow baseline generation on prompts > 4096 tokens (its default).
+            # 32768 covers typical model context windows.
+            ctx = 32768
+            os.environ.setdefault("DFLASH_MAX_CTX", str(ctx))
             logger.info(
                 f"DFlash speculative decode enabled: "
-                f"target={target_ref}, draft={draft_ref}"
+                f"target={target_ref}, draft={draft_ref}, "
+                f"DFLASH_MAX_CTX={os.environ['DFLASH_MAX_CTX']}"
             )
         else:
             logger.info("DFlash speculative decode disabled")
