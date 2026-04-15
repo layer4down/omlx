@@ -708,12 +708,20 @@ class EngineCore:
 
                 # run_dflash_generation is now a generator — yields events as they arrive
                 # so tokens stream to the collector in real-time instead of batching
+                # Unwrap VLMModelAdapter to get the raw model dflash_mlx expects.
+                # dflash_mlx needs model.language_model (VLM) or model.model (mlx-lm).
+                raw_model = self.model
+                if hasattr(raw_model, '_vlm_model'):
+                    raw_model = raw_model._vlm_model
+
                 for event in run_dflash_generation(
                     target_ref=self._dflash_target_ref,
                     draft_ref=self._dflash_draft_ref,
                     prompt=prompt,
                     max_tokens=max_tokens,
                     use_chat_template=use_chat_template,
+                    target_model=raw_model,
+                    tokenizer=self.tokenizer,
                 ):
                     if event.get("event") == "token":
                         # Lazily resolve tokenizer on first token

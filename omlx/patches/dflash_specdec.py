@@ -77,6 +77,8 @@ def run_dflash_generation(
     use_chat_template: bool = True,
     block_tokens: int = 16,
     stop_token_ids: Optional[list[int]] = None,
+    target_model: Any = None,
+    tokenizer: Any = None,
 ):
     """Run DFlash generation, yielding events as they arrive.
 
@@ -91,30 +93,85 @@ def run_dflash_generation(
         use_chat_template: Whether to apply chat template.
         block_tokens: Block size for draft generation.
         stop_token_ids: Token IDs that stop generation.
+        target_model: Pre-loaded target model (avoids double-loading ~54GB).
+        tokenizer: Pre-loaded tokenizer (paired with target_model).
 
     Yields:
         Dicts with 'event' key ('token', 'summary', or 'error').
     """
-    from dflash_mlx.runtime import stream_dflash_generate, load_target_bundle
+    from dflash_mlx.runtime import (
+        stream_dflash_generate,
+        load_target_bundle,
+    )
 
     draft_model = load_draft_model(draft_ref)
 
-    # Load target model with DFlash's own loader (ensures compatible weight format).
-    cache_key = f"{target_ref}::{draft_ref}"
-    with _cache_lock:
-        if cache_key not in _cached_drafts:
-            _cached_drafts[cache_key] = {}
-        target_cache = _cached_drafts[cache_key]
-        if "target" not in target_cache:
-            logger.info(f"Loading DFlash target model: {target_ref}")
-            t0 = time.time()
-            target_model, tokenizer, _ = load_target_bundle(target_ref, lazy=True)
-            elapsed = time.time() - t0
-            logger.info(f"DFlash target model loaded in {elapsed:.1f}s")
-            target_cache["target"] = target_model
-            target_cache["tokenizer"] = tokenizer
-        target_model = target_cache["target"]
-        tokenizer = target_cache["tokenizer"]
+    if target_model is not None and tokenizer is not None:
+        # Use pre-loaded target model from oMLX engine (zero-copy, saves ~54GB RAM).
+        # Note: dflash_mlx installs hooks on the model that are incompatible with
+        # VLM-loaded models (different __call__ signature). We fall back to
+        # load_target_bundle for the model structure but share weight arrays.
+        logger.info("DFlash attempting zero-copy weight sharing with target model")
+        try:
+            import mlx.core as mx
+            import mlx.nn as nn
+            from dflash_mlx.runtime import load_target_bundle
+
+            # Load the dflash-compatible model structure (lightweight, no weight data)
+            df_model, df_tokenizer, _ = load_target_bundle(target_ref, lazy=True)
+
+            # Share weight arrays from oMLX's already-loaded model (~54GB savings)
+            omlx_text = target_model
+            if hasattr(omlx_text, 'language_model'):
+                omlx_text = omlx_text.language_model
+            if hasattr(omlx_text, 'model'):
+                omlx_text = omlx_text.model
+
+            df_text = df_model
+            if hasattr(df_text, 'language_model'):
+                df_text = df_text.language_model
+            if hasattr(df_text, 'model'):
+                df_text = df_text.model
+
+            # Replace dflash model's weights with oMLX's shared arrays.
+            # parameters() returns a flat generator of (name, array) tuples.
+            shared = 0
+            omlx_weights = dict(omlx_text.parameters())
+            df_weights = dict(df_text.parameters())
+            for name in df_weights:
+                if name in omlx_weights:
+                    parts = name.split('.')
+                    obj = df_text
+                    for part in parts[:-1]:
+                        obj = getattr(obj, part, None)
+                        if obj is None:
+                            break
+                    if obj is not None and hasattr(obj, parts[-1]):
+                        setattr(obj, parts[-1], omlx_weights[name])
+                        shared += 1
+
+            logger.info(f"DFlash weight sharing: {shared} parameters shared (zero-copy)")
+            target_model = df_model
+            tokenizer = df_tokenizer
+        except Exception as e:
+            logger.warning(f"DFlash zero-copy weight sharing failed: {e}, loading from disk")
+            target_model = None  # Fall through to disk load below
+        # Fallback: load target model from disk (uses extra ~54GB).
+        cache_key = f"{target_ref}::{draft_ref}"
+        with _cache_lock:
+            if cache_key not in _cached_drafts:
+                _cached_drafts[cache_key] = {}
+            target_cache = _cached_drafts[cache_key]
+            if "target" not in target_cache:
+                logger.info(f"Loading DFlash target model: {target_ref}")
+                t0 = time.time()
+                target_model, tokenizer, _ = load_target_bundle(target_ref, lazy=True)
+                elapsed = time.time() - t0
+                logger.info(f"DFlash target model loaded in {elapsed:.1f}s")
+                target_cache["target"] = target_model
+                target_cache["tokenizer"] = tokenizer
+            target_model = target_cache["target"]
+            tokenizer = target_cache["tokenizer"]
 
     try:
         for event in stream_dflash_generate(
