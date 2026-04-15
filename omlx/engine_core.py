@@ -619,15 +619,14 @@ class EngineCore:
         self._dflash_target_ref = target_ref
         self._dflash_draft_ref = draft_ref
         if enabled:
-            # Set DFLASH_MAX_CTX so dflash_mlx doesn't silently fall back to
-            # slow baseline generation on prompts > 4096 tokens (its default).
-            # 32768 covers typical model context windows.
-            ctx = 32768
-            os.environ.setdefault("DFLASH_MAX_CTX", str(ctx))
+            # dflash_mlx v0.1.3+ defaults to sys.maxsize (unlimited) when
+            # DFLASH_MAX_CTX is unset or 0.  Only set it if the user
+            # explicitly wants to cap context for DFlash.
+            max_ctx_val = os.environ.get("DFLASH_MAX_CTX", "0")
             logger.info(
                 f"DFlash speculative decode enabled: "
                 f"target={target_ref}, draft={draft_ref}, "
-                f"DFLASH_MAX_CTX={os.environ['DFLASH_MAX_CTX']}"
+                f"DFLASH_MAX_CTX={'unlimited' if max_ctx_val in ('0', '') else max_ctx_val}"
             )
         else:
             logger.info("DFlash speculative decode disabled")

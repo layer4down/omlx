@@ -513,18 +513,20 @@ def _install_dflash_mlx(export_dir: Path):
         print("  ✓ dflash_mlx already present in build")
         return
 
-    # Try copying from the currently installed oMLX app, then backups (newest first)
+    # Try copying from the currently installed oMLX app, then backups (newest first),
+    # then from a cloned dflash-mlx repo (source install).
     candidates = [
         Path("/Applications/oMLX.app/Contents/Frameworks/framework-mlx-framework/lib/python3.11/site-packages/dflash_mlx"),
-        Path("/Applications/oMLX-v0.3.5.3-rc4-patched.app.bak/Contents/Frameworks/framework-mlx-framework/lib/python3.11/site-packages/dflash_mlx"),
-        Path("/Applications/oMLX-v0.3.6.patched.app.bak/Contents/Frameworks/framework-mlx-framework/lib/python3.11/site-packages/dflash_mlx"),
+        *[p / "Contents/Frameworks/framework-mlx-framework/lib/python3.11/site-packages/dflash_mlx"
+          for p in sorted(Path("/Applications").glob("oMLX-v*.app.bak"), reverse=True)],
+        Path.home() / "Documents/GitHub/dflash-mlx-latest/dflash_mlx",
     ]
     src = None
     for candidate in candidates:
         if candidate.exists():
             src = candidate
             break
-    if not src.exists():
+    if src is None:
         print("  ⚠ dflash_mlx not found — DFlash speculative decoding will not be available")
         return
 
