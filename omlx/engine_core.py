@@ -722,6 +722,7 @@ class EngineCore:
                     use_chat_template=use_chat_template,
                     target_model=raw_model,
                     tokenizer=self.tokenizer,
+                    stop_token_ids=[248046, 248045],  # <|im_end|>, <|im_start|>
                 ):
                     if event.get("event") == "token":
                         # Lazily resolve tokenizer on first token
@@ -734,6 +735,9 @@ class EngineCore:
                                 # Fallback: use engine's own tokenizer
                                 tokenizer = self.tokenizer
                         token_id = int(event["token_id"])
+                        # Skip chat template boundary tokens
+                        if token_id in (248045, 248046):  # <|im_start|>, <|im_end|>
+                            continue
                         text = tokenizer.decode([token_id])
                         completion_tokens += 1
                         collector.put(RequestOutput(
