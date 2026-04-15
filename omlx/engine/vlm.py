@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import copy
 import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1174,9 +1175,17 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
-        # Speculative Decode (DFlash): route to DFlash if enabled
+        # Speculative Decode (DFlash): route to DFlash if enabled and prompt fits.
+        # DFlash prefill is much slower than normal prefill for large prompts
+        # (processes through both target + draft models, captures hidden states).
+        # For prompts exceeding the threshold, fall back to normal engine which
+        # has optimized prefill with paged cache and SSD cache.
+        # See: jundot/omlx DFlashEngine._should_fallback()
         specdec_enabled = kwargs.pop("specdec_enabled", False)
-        if specdec_enabled and self._engine.is_dflash_enabled():
+        _dflash_ctx_limit = int(os.environ.get("DFLASH_MAX_CTX", "0") or "0") or 4096
+        _prompt_token_count = len(self._tokenizer.encode(prompt)) if hasattr(self, '_tokenizer') and self._tokenizer else 0
+        _dflash_fallback = _prompt_token_count >= _dflash_ctx_limit
+        if specdec_enabled and self._engine.is_dflash_enabled() and not _dflash_fallback:
             logger.info(f"[VLM] Routing to DFlash speculative decode (generate, specdec_enabled={specdec_enabled})")
             request_id = await self._engine.add_dflash_request(
                 prompt=prompt,
@@ -1283,9 +1292,13 @@ class VLMBatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
-        # Speculative Decode (DFlash): route to DFlash if enabled
+        # Speculative Decode (DFlash): route to DFlash if enabled and prompt fits.
+        # Same fallback logic as generate() — skip DFlash for large prompts.
         specdec_enabled = kwargs.pop("specdec_enabled", False)
-        if specdec_enabled and self._engine.is_dflash_enabled():
+        _dflash_ctx_limit = int(os.environ.get("DFLASH_MAX_CTX", "0") or "0") or 4096
+        _prompt_token_count = len(self._tokenizer.encode(prompt)) if hasattr(self, '_tokenizer') and self._tokenizer else 0
+        _dflash_fallback = _prompt_token_count >= _dflash_ctx_limit
+        if specdec_enabled and self._engine.is_dflash_enabled() and not _dflash_fallback:
             logger.info(f"[VLM] Routing to DFlash speculative decode (specdec_enabled={specdec_enabled})")
             request_id = await self._engine.add_dflash_request(
                 prompt=prompt,
@@ -1293,8 +1306,13 @@ class VLMBatchedEngine(BaseEngine):
                 use_chat_template=False,  # prompt is already chat-templated by oMLX
             )
         else:
-            if specdec_enabled:
+            if specdec_enabled and not _dflash_fallback:
                 logger.warning(f"[VLM] specdec_enabled but DFlash not configured (is_dflash={self._engine.is_dflash_enabled()})")
+            elif _dflash_fallback:
+                logger.info(
+                    f"[VLM] DFlash fallback: prompt has {_prompt_token_count} tokens "
+                    f"(>= limit {_dflash_ctx_limit}), using normal engine"
+                )
             request_id = await self._engine.add_request(
                 prompt=prompt,
                 sampling_params=sampling_params,
