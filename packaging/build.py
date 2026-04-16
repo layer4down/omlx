@@ -496,7 +496,8 @@ def _install_dflash_mlx(export_dir: Path):
     """Install dflash_mlx into the exported framework.
 
     dflash_mlx provides DFlash speculative decoding. It's not on PyPI, so we
-    copy it from the previous app bundle's site-packages if available, or skip.
+    copy it from the latest available source. Prefers the cloned repo (latest
+    version) over the installed app bundle (may be stale).
     """
     fw_site = (
         export_dir
@@ -508,18 +509,12 @@ def _install_dflash_mlx(export_dir: Path):
     if not fw_site.exists():
         return
 
-    # Already installed (e.g. from a previous build cache)?
-    if (fw_site / "dflash_mlx").exists():
-        print("  ✓ dflash_mlx already present in build")
-        return
-
-    # Try copying from the currently installed oMLX app, then backups (newest first),
-    # then from a cloned dflash-mlx repo (source install).
+    # Prefer the cloned repo (latest version), then installed app, then backups.
     candidates = [
+        Path.home() / "Documents/GitHub/dflash-mlx-latest/dflash_mlx",
         Path("/Applications/oMLX.app/Contents/Frameworks/framework-mlx-framework/lib/python3.11/site-packages/dflash_mlx"),
         *[p / "Contents/Frameworks/framework-mlx-framework/lib/python3.11/site-packages/dflash_mlx"
-          for p in sorted(Path("/Applications").glob("oMLX-v*.app.bak"), reverse=True)],
-        Path.home() / "Documents/GitHub/dflash-mlx-latest/dflash_mlx",
+          for p in sorted(Path("/Applications").glob("oMLX-v*.app*"), reverse=True)],
     ]
     src = None
     for candidate in candidates:
@@ -527,12 +522,29 @@ def _install_dflash_mlx(export_dir: Path):
             src = candidate
             break
     if src is None:
+        # Check if already installed from a previous build
+        if (fw_site / "dflash_mlx").exists():
+            print("  ✓ dflash_mlx already present in build (no newer source found)")
+            return
         print("  ⚠ dflash_mlx not found — DFlash speculative decoding will not be available")
         return
 
+    # Remove existing installation if present (upgrade)
+    existing = fw_site / "dflash_mlx"
+    if existing.exists():
+        shutil.rmtree(existing)
+
     print(f"\n  Installing dflash_mlx from {src}...")
     shutil.copytree(src, fw_site / "dflash_mlx")
-    print("  ✓ dflash_mlx installed")
+    # Report version
+    ver_file = fw_site / "dflash_mlx" / "__init__.py"
+    if ver_file.exists():
+        for line in ver_file.read_text().splitlines():
+            if "__version__" in line:
+                print(f"  ✓ dflash_mlx {line.strip().split('=')[1].strip().strip('\"')}")
+                break
+    else:
+        print("  ✓ dflash_mlx installed")
 
 
 # Packages to strip from the app bundle. These are transitive dependencies
